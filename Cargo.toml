@@ -1,0 +1,8 @@
+[package]
+name = "animation_playground"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = ["3d"] }
+bevy_gearbox = "0.8"
