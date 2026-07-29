@@ -1,91 +1,141 @@
 use std::time::Duration;
 
 use bevy::{
-    animation::{RepeatAnimation},
-    gltf::Gltf,
-    prelude::*,
-    scene::prelude::{bsn, CommandsSceneExt},
+    animation::RepeatAnimation, gltf::Gltf, platform::collections::HashMap, prelude::*,
     world_serialization::WorldInstanceReady,
 };
-use bevy_gearbox::prelude::*;
-use bevy_gearbox::GearboxPlugin;
+use bevy_fsm::{
+    Enter, EnumEvent, FSMPlugin, FSMState, FSMTransition, StateChangeRequest, fsm_observer,
+};
 
 const CHARACTER_PATH: &str = "models/character.glb";
 const JUMP_START_SECS: f32 = 0.8;
+const JUMP_LOOP_SECS: f32 = 0.1; // auto-land timing
 const JUMP_LAND_SECS: f32 = 0.6;
 
+const LOWER_BODY_MASK_GROUP: u32 = 1;
+const LOWER_BODY_MASK: u64 = 1 << LOWER_BODY_MASK_GROUP;
+const UPPER_BODY_MASK_GROUP: u32 = 2;
+const UPPER_BODY_MASK: u64 = 1 << UPPER_BODY_MASK_GROUP;
+
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins)
-        .add_plugins(GearboxPlugin::default())
+    let mut app = App::new();
+    build_app(&mut app);
+    app.add_plugins(DefaultPlugins)
+        .add_plugins(FSMPlugin::<LocomotionState>::default())
+        .add_plugins(FSMPlugin::<AirborneState>::default())
         .add_systems(Startup, (spawn_character, setup_camera_and_light))
         .add_systems(
             Update,
             (
-                drive_locomotion_messages.before(GearboxSet),
-                play_state_animation.after(GearboxSet),
+                drive_locomotion_input,
+                tick_delayed_state_changes::<AirborneState>,
             ),
         )
         .run();
 }
 
-// ---------- Messages that drive transitions ----------
-// Each just needs to know which state-machine entity it targets;
-// GearboxMessage's derive walks `SubstateOf` up to the root for us.
+fn build_app(app: &mut App) {
+    fsm_observer!(app, LocomotionState, on_enter_locomotion);
 
-#[derive(Message, Clone, Reflect, GearboxMessage)]
-struct StartWalk {
-    #[gearbox(target)]
-    machine: Entity,
-}
-#[derive(Message, Clone, Reflect, GearboxMessage)]
-struct StartRun {
-    #[gearbox(target)]
-    machine: Entity,
-}
-#[derive(Message, Clone, Reflect, GearboxMessage)]
-struct SlowDown {
-    #[gearbox(target)]
-    machine: Entity,
-}
-#[derive(Message, Clone, Reflect, GearboxMessage)]
-struct Stop {
-    #[gearbox(target)]
-    machine: Entity,
-}
-#[derive(Message, Clone, Reflect, GearboxMessage)]
-struct Jump {
-    #[gearbox(target)]
-    machine: Entity,
+    fsm_observer!(app, AirborneState, on_enter_grounded);
+    fsm_observer!(app, AirborneState, on_enter_jump_start);
+    fsm_observer!(app, AirborneState, on_enter_jump_loop);
+    fsm_observer!(app, AirborneState, on_enter_jump_land);
 }
 
-#[derive(Message, Clone, Reflect, GearboxMessage)]
-struct Land {
-    #[gearbox(target)]
-    machine: Entity,
-}
+// ---------- Locomotion layer (legs) ----------
 
-// ---------- Linking the state machine to the rig ----------
-
-#[derive(Component, Clone)]
-struct CharacterAnimations {
-    idle: AnimationNodeIndex,
-    walk: AnimationNodeIndex,
-    run: AnimationNodeIndex,
-    jump_start: AnimationNodeIndex,
-    jump_loop: AnimationNodeIndex,
-    jump_land: AnimationNodeIndex,
-}
-
-/// Tracks what we last *requested*, purely so `drive_locomotion_messages`
-/// doesn't spam the same message every frame. The gearbox `Active` markers
-/// remain the single source of truth for actual state.
-#[derive(Component, Clone, Copy, Default, PartialEq)]
-enum Locomotion {
-    #[default]
+#[derive(Component, EnumEvent, FSMState, Reflect, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[reflect(Component)]
+enum LocomotionState {
     Idle,
     Walk,
     Run,
+}
+
+impl FSMTransition for LocomotionState {
+    fn can_transition(_from: Self, _to: Self) -> bool {
+        true // any of the three to any other is fine
+    }
+}
+
+// ---------- Airborne layer (jump), independent of locomotion ----------
+
+#[derive(Component, EnumEvent, FSMState, Reflect, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[reflect(Component)]
+enum AirborneState {
+    Grounded,
+    JumpStart,
+    JumpLoop,
+    JumpLand,
+}
+
+impl FSMTransition for AirborneState {
+    fn can_transition(from: Self, to: Self) -> bool {
+        use AirborneState::*;
+        matches!(
+            (from, to),
+            (Grounded, JumpStart)
+                | (JumpStart, JumpLoop)
+                | (JumpLoop, JumpLand)
+                | (JumpLand, Grounded)
+        ) || from == to
+    }
+}
+
+// ---------- Generic timed auto-transition ----------
+
+#[derive(Component)]
+struct DelayedStateChange<S: FSMState> {
+    next: S,
+    timer: Timer,
+}
+
+fn tick_delayed_state_changes<S: FSMState>(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut DelayedStateChange<S>)>,
+) {
+    for (entity, mut delayed) in &mut q {
+        if delayed.timer.tick(time.delta()).just_finished() {
+            commands.trigger(StateChangeRequest {
+                entity,
+                next: delayed.next,
+            });
+            commands.entity(entity).remove::<DelayedStateChange<S>>();
+        }
+    }
+}
+
+// ---------- Shared animation table ----------
+
+#[derive(Clone, Copy)]
+struct AnimationStateInfo {
+    node: AnimationNodeIndex,
+    repeat: RepeatAnimation,
+    blend: Duration,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq, Debug)]
+pub enum AnimationState {
+    Idle,
+    WalkLoop,
+    JogFwdLoop,
+    JumpStart,
+    JumpLoop,
+    JumpLand,
+}
+
+#[derive(Component, Clone)]
+struct CharacterAnimations {
+    states: HashMap<AnimationState, AnimationStateInfo>,
+}
+
+impl CharacterAnimations {
+    fn get(&self, key: AnimationState) -> Option<&AnimationStateInfo> {
+        self.states.get(&key)
+    }
 }
 
 #[derive(Component, Clone)]
@@ -110,7 +160,12 @@ fn setup_camera_and_light(mut commands: Commands) {
             shadow_maps_enabled: true,
             ..default()
         },
-        Transform::from_rotation(Quat::from_euler(EulerRot::ZYX, 0.0, 1.0, -std::f32::consts::PI / 4.)),
+        Transform::from_rotation(Quat::from_euler(
+            EulerRot::ZYX,
+            0.0,
+            1.0,
+            -std::f32::consts::PI / 4.,
+        )),
     ));
 }
 
@@ -150,14 +205,57 @@ fn on_character_ready(
 
     let mut graph = AnimationGraph::new();
     let root = graph.root;
-    let anims = CharacterAnimations {
-        idle: graph.add_clip(gltf.named_animations["Idle_Loop"].clone(), 1.0, root),
-        walk: graph.add_clip(gltf.named_animations["Walk_Loop"].clone(), 1.0, root),
-        run: graph.add_clip(gltf.named_animations["Jog_Fwd_Loop"].clone(), 1.0, root),
-        jump_start: graph.add_clip(gltf.named_animations["Jump_Start"].clone(), 1.0, root),
-        jump_loop: graph.add_clip(gltf.named_animations["Jump_Loop"].clone(), 1.0, root),
-        jump_land: graph.add_clip(gltf.named_animations["Jump_Land"].clone(), 1.0, root),
-    };
+
+    let mut states = HashMap::new();
+    states.insert(
+        AnimationState::Idle,
+        AnimationStateInfo {
+            node: graph.add_clip(gltf.named_animations["Idle_Loop"].clone(), 1.0, root),
+            repeat: RepeatAnimation::Forever,
+            blend: Duration::from_millis(300),
+        },
+    );
+    states.insert(
+        AnimationState::WalkLoop,
+        AnimationStateInfo {
+            node: graph.add_clip(gltf.named_animations["Walk_Loop"].clone(), 1.0, root),
+            repeat: RepeatAnimation::Forever,
+            blend: Duration::from_millis(250),
+        },
+    );
+    states.insert(
+        AnimationState::JogFwdLoop,
+        AnimationStateInfo {
+            node: graph.add_clip(gltf.named_animations["Jog_Fwd_Loop"].clone(), 1.0, root),
+            repeat: RepeatAnimation::Forever,
+            blend: Duration::from_millis(200),
+        },
+    );
+    states.insert(
+        AnimationState::JumpStart,
+        AnimationStateInfo {
+            node: graph.add_clip(gltf.named_animations["Jump_Start"].clone(), 1.0, root),
+            repeat: RepeatAnimation::Never,
+            blend: Duration::from_millis(80),
+        },
+    );
+    states.insert(
+        AnimationState::JumpLoop,
+        AnimationStateInfo {
+            node: graph.add_clip(gltf.named_animations["Jump_Loop"].clone(), 1.0, root),
+            repeat: RepeatAnimation::Forever,
+            blend: Duration::from_millis(150),
+        },
+    );
+    states.insert(
+        AnimationState::JumpLand,
+        AnimationStateInfo {
+            node: graph.add_clip(gltf.named_animations["Jump_Land"].clone(), 1.0, root),
+            repeat: RepeatAnimation::Never,
+            blend: Duration::from_millis(80),
+        },
+    );
+
     let graph_handle = graphs.add(graph);
 
     commands.entity(rig_entity).insert((
@@ -165,114 +263,159 @@ fn on_character_ready(
         AnimationTransitions::new(),
     ));
 
-    // The state machine is its own scene, linked back to the rig via `template`.
-    commands.spawn_scene(bsn! {
-        #Character
-            // template(move |_| Ok((AnimationRig(rig_entity), anims.clone(), Locomotion::default())))
-            StateMachine InitialState(#Locomotion)
-        Substates [
-            #Locomotion History InitialState(#Idle) Substates [
-            #Idle Transitions [
-                (Target(#Walk) MessageEdge::<StartWalk>),
-                (Target(#Run)  MessageEdge::<StartRun>),
-                (Target(#Jump) MessageEdge::<Jump>),
-            ],
-            #Walk Transitions [
-                (Target(#Run)  MessageEdge::<StartRun>),
-                (Target(#Idle) MessageEdge::<Stop>),
-                (Target(#Jump) MessageEdge::<Jump>),
-            ],
-            #Run Transitions [
-                (Target(#Walk) MessageEdge::<StartWalk>),
-                (Target(#Idle) MessageEdge::<Stop>),
-                (Target(#Jump) MessageEdge::<Jump>),
-            ],
-        ],
-        #Jump InitialState(#Jump_Start) Substates [
-            #Jump_Start Transitions [
-                (Target(#Jump_Loop) AlwaysEdge Delay::from_secs_f32(JUMP_START_SECS)),
-            ],
-            #Jump_Loop Transitions [
-                // (Target(#Jump_Land) MessageEdge::<Land>),
-                (Target(#Jump_Land) AlwaysEdge Delay::from_secs_f32(0.1)), // auto-land after 0.1s
-            ],
-            #Jump_Land Transitions [
-                (Target(#Locomotion) AlwaysEdge Delay::from_secs_f32(JUMP_LAND_SECS)),
-            ],
-        ],
-        ]
-    })
-    .insert((
-        CharacterLink { rig: rig_entity, anims },
-        Locomotion::default(),
+    commands.entity(ready.entity).insert((
+        LocomotionState::Idle,
+        AirborneState::Grounded,
+        CharacterLink {
+            rig: rig_entity,
+            anims: CharacterAnimations { states },
+        },
     ));
 }
 
-// ---------- Gameplay -> messages ----------
+// ---------- Animation reactions ----------
 
-fn drive_locomotion_messages(
+fn play_locomotion(
+    entity: Entity,
+    state: LocomotionState,
+    links: &Query<&CharacterLink>,
+    rigs: &mut Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+) {
+    let Ok(link) = links.get(entity) else { return };
+    let key = match state {
+        LocomotionState::Idle => AnimationState::Idle,
+        LocomotionState::Walk => AnimationState::WalkLoop,
+        LocomotionState::Run => AnimationState::JogFwdLoop,
+    };
+    if let Some(info) = link.anims.get(key) {
+        if let Ok((mut player, mut transitions)) = rigs.get_mut(link.rig) {
+            transitions
+                .play(&mut player, info.node, info.blend)
+                .set_repeat(info.repeat);
+        }
+    }
+}
+
+fn play_jump(
+    entity: Entity,
+    state: AirborneState,
+    links: &Query<&CharacterLink>,
+    rigs: &mut Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+) {
+    let Ok(link) = links.get(entity) else { return };
+    let key = match state {
+        AirborneState::JumpStart => AnimationState::JumpStart,
+        AirborneState::JumpLoop => AnimationState::JumpLoop,
+        AirborneState::JumpLand => AnimationState::JumpLand,
+        AirborneState::Grounded => return, // handled by on_enter_grounded via locomotion
+    };
+    if let Some(info) = link.anims.get(key) {
+        if let Ok((mut player, mut transitions)) = rigs.get_mut(link.rig) {
+            transitions
+                .play(&mut player, info.node, info.blend)
+                .set_repeat(info.repeat);
+        }
+    }
+}
+
+fn on_enter_locomotion(
+    trigger: On<Enter<LocomotionState>>,
+    links: Query<&CharacterLink>,
+    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+) {
+    play_locomotion(trigger.entity, trigger.state, &links, &mut rigs);
+}
+
+fn on_enter_grounded(
+    trigger: On<Enter<airborne_state::Grounded>>,
+    locomotion: Query<&LocomotionState>,
+    links: Query<&CharacterLink>,
+    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+) {
+    if let Ok(&state) = locomotion.get(trigger.entity) {
+        play_locomotion(trigger.entity, state, &links, &mut rigs);
+    }
+}
+
+fn on_enter_jump_start(
+    trigger: On<Enter<airborne_state::JumpStart>>,
+    mut commands: Commands,
+    links: Query<&CharacterLink>,
+    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+) {
+    play_jump(trigger.entity, AirborneState::JumpStart, &links, &mut rigs);
+    commands
+        .delayed()
+        .secs(JUMP_START_SECS)
+        .trigger(StateChangeRequest {
+            entity: trigger.entity,
+            next: AirborneState::JumpLoop,
+        });
+}
+
+fn on_enter_jump_loop(
+    trigger: On<Enter<airborne_state::JumpLoop>>,
+    mut commands: Commands,
+    links: Query<&CharacterLink>,
+    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+) {
+    info!("Jump Loop");
+    play_jump(trigger.entity, AirborneState::JumpLoop, &links, &mut rigs);
+    commands
+        .delayed()
+        .secs(JUMP_LOOP_SECS)
+        .trigger(StateChangeRequest {
+            entity: trigger.entity,
+            next: AirborneState::JumpLand,
+        });
+}
+
+fn on_enter_jump_land(
+    trigger: On<Enter<airborne_state::JumpLand>>,
+    mut commands: Commands,
+    links: Query<&CharacterLink>,
+    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+) {
+    info!("Jump Land");
+    play_jump(trigger.entity, AirborneState::JumpLand, &links, &mut rigs);
+    commands
+        .delayed()
+        .secs(JUMP_LAND_SECS)
+        .trigger(StateChangeRequest {
+            entity: trigger.entity,
+            next: AirborneState::Grounded,
+        });
+}
+
+// ---------- Input ----------
+
+fn drive_locomotion_input(
+    mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
-    mut characters: Query<(Entity, &mut Locomotion), With<StateMachine>>,
-    mut walk_w: MessageWriter<StartWalk>,
-    mut run_w: MessageWriter<StartRun>,
-    mut stop_w: MessageWriter<Stop>,
-    mut jump_w: MessageWriter<Jump>,
+    characters: Query<(Entity, &LocomotionState, &AirborneState)>,
 ) {
     let moving = keys.any_pressed([KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD]);
     let sprinting = keys.pressed(KeyCode::ShiftLeft);
     let desired = match (moving, sprinting) {
-        (false, _) => Locomotion::Idle,
-        (true, false) => Locomotion::Walk,
-        (true, true) => Locomotion::Run,
+        (false, _) => LocomotionState::Idle,
+        (true, false) => LocomotionState::Walk,
+        (true, true) => LocomotionState::Run,
     };
 
-    for (machine, mut locomotion) in &mut characters {
-        if desired != *locomotion {
-            match &desired {
-                Locomotion::Walk => { walk_w.write(StartWalk { machine }); }
-                Locomotion::Run => { run_w.write(StartRun { machine }); }
-                Locomotion::Idle => { stop_w.write(Stop { machine }); }
+    for (entity, &locomotion, &airborne) in &characters {
+        if airborne == AirborneState::Grounded {
+            if locomotion != desired {
+                commands.trigger(StateChangeRequest {
+                    entity,
+                    next: desired,
+                });
             }
-            *locomotion = desired;
+            if keys.just_pressed(KeyCode::Space) {
+                commands.trigger(StateChangeRequest {
+                    entity,
+                    next: AirborneState::JumpStart,
+                });
+            }
         }
-
-        if keys.just_pressed(KeyCode::Space) {
-            jump_w.write(Jump { machine });
-        }
-    }
-}
-
-// ---------- Gearbox state -> animation ----------
-
-fn animation_for_state(name: &str, anims: &CharacterAnimations) -> Option<(AnimationNodeIndex, RepeatAnimation, Duration)> {
-    match name {
-        "Idle" => Some((anims.idle, RepeatAnimation::Forever, Duration::from_millis(300))),
-        "Walk" => Some((anims.walk, RepeatAnimation::Forever, Duration::from_millis(250))),
-        "Run"  => Some((anims.run,  RepeatAnimation::Forever, Duration::from_millis(200))),
-        "Jump_Start" => Some((anims.jump_start, RepeatAnimation::Never,   Duration::from_millis(80))),
-        "Jump_Loop" => Some((anims.jump_loop, RepeatAnimation::Forever,   Duration::from_millis(250))),
-        "Jump_Land" => Some((anims.jump_land, RepeatAnimation::Never,   Duration::from_millis(80))),
-        _ => None,
-    }
-}
-
-fn play_state_animation(
-    entered: Query<(&Name, &Active), Added<Active>>,
-    characters: Query<&CharacterLink>,
-    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
-) {
-    for (name, active) in &entered {
-         let Ok(link) = characters.get(active.machine) else {
-            continue;
-        };
-         let Ok((mut player, mut transitions)) = rigs.get_mut(link.rig) else {
-            continue;
-        };
-
-        let Some((node, repeat, blend)) = animation_for_state(name.as_str(), &link.anims) else {
-            continue;
-        };
-
-        transitions.play(&mut player, node, blend).set_repeat(repeat);
     }
 }

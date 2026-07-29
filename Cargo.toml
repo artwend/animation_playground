@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["3d"] }
-bevy_gearbox = "0.8"
+bevy_fsm = "0.4"
