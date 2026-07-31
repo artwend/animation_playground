@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["3d"] }
 bevy_fsm = "0.4"
+bevy-animation-controllers = { git = "https://github.com/pcwalton/bevy-animation-controllers"}
+smallvec = "1.15"
+strum = { version = "0.28", features = ["derive"] }

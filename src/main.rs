@@ -1,12 +1,17 @@
-use std::time::Duration;
-
+use std::{borrow::Cow, time::Duration};
+use smallvec::smallvec;
 use bevy::{
-    animation::RepeatAnimation, gltf::Gltf, platform::collections::HashMap, prelude::*,
-    world_serialization::WorldInstanceReady,
+    animation::RepeatAnimation, app::AnimationSystems, gltf::Gltf, platform::collections::HashMap, prelude::*, world_serialization::WorldInstanceReady,
+};
+use bevy_animation_controllers::{
+    AnimationBlend, AnimationBlendAsset, AnimationLayer, LabeledAnimationBlend,
+    control::AnimationTransitionMode,
+    playback::{self, PlayingAnimation, PlayingAnimations},
 };
 use bevy_fsm::{
     Enter, EnumEvent, FSMPlugin, FSMState, FSMTransition, StateChangeRequest, fsm_observer,
 };
+use strum::{AsRefStr, IntoStaticStr};
 
 const CHARACTER_PATH: &str = "models/character.glb";
 const JUMP_START_SECS: f32 = 0.8;
@@ -22,16 +27,18 @@ fn main() {
     let mut app = App::new();
     build_app(&mut app);
     app.add_plugins(DefaultPlugins)
+        .init_asset::<AnimationBlendAsset>()
         .add_plugins(FSMPlugin::<LocomotionState>::default())
         .add_plugins(FSMPlugin::<AirborneState>::default())
         .add_systems(Startup, (spawn_character, setup_camera_and_light))
+        .add_systems(Update, drive_locomotion_input)
         .add_systems(
-            Update,
-            (
-                drive_locomotion_input,
-                tick_delayed_state_changes::<AirborneState>,
-            ),
+            PostUpdate,
+            (playback::advance_transitions, playback::expire_completed_transitions)
+                .before(bevy::animation::animate_targets)
+                .in_set(AnimationSystems),
         )
+        .add_observer(on_enter_locomotion)
         .run();
 }
 
@@ -42,6 +49,23 @@ fn build_app(app: &mut App) {
     fsm_observer!(app, AirborneState, on_enter_jump_start);
     fsm_observer!(app, AirborneState, on_enter_jump_loop);
     fsm_observer!(app, AirborneState, on_enter_jump_land);
+}
+
+// ---------- Trait abstractions shared by every FSM layer ----------
+
+trait AnimatedState: FSMState {
+    /// Key into the shared animation table.
+    fn animation_key(self) -> Option<AnimationState>;
+
+    /// Optional animation group for layering.
+    fn mask_group(self) -> u32 {
+        0
+    }
+
+    /// Optional mask for layering.
+    fn mask(self) -> u64 {
+        u64::MAX
+    }
 }
 
 // ---------- Locomotion layer (legs) ----------
@@ -57,6 +81,24 @@ enum LocomotionState {
 impl FSMTransition for LocomotionState {
     fn can_transition(_from: Self, _to: Self) -> bool {
         true // any of the three to any other is fine
+    }
+}
+
+impl AnimatedState for LocomotionState {
+    fn animation_key(self) -> Option<AnimationState> {
+        match self {
+            LocomotionState::Idle => Some(AnimationState::Idle),
+            LocomotionState::Walk => Some(AnimationState::WalkLoop),
+            LocomotionState::Run => Some(AnimationState::JogFwdLoop),
+        }
+    }
+
+    fn mask_group(self) -> u32 {
+        LOWER_BODY_MASK_GROUP
+    }
+
+    fn mask(self) -> u64 {
+        LOWER_BODY_MASK
     }
 }
 
@@ -84,40 +126,17 @@ impl FSMTransition for AirborneState {
     }
 }
 
-// ---------- Generic timed auto-transition ----------
-
-#[derive(Component)]
-struct DelayedStateChange<S: FSMState> {
-    next: S,
-    timer: Timer,
-}
-
-fn tick_delayed_state_changes<S: FSMState>(
-    mut commands: Commands,
-    time: Res<Time>,
-    mut q: Query<(Entity, &mut DelayedStateChange<S>)>,
-) {
-    for (entity, mut delayed) in &mut q {
-        if delayed.timer.tick(time.delta()).just_finished() {
-            commands.trigger(StateChangeRequest {
-                entity,
-                next: delayed.next,
-            });
-            commands.entity(entity).remove::<DelayedStateChange<S>>();
-        }
-    }
-}
-
 // ---------- Shared animation table ----------
 
 #[derive(Clone, Copy)]
 struct AnimationStateInfo {
     node: AnimationNodeIndex,
+    clip_id: AssetId<AnimationClip>,
     repeat: RepeatAnimation,
     blend: Duration,
 }
 
-#[derive(Clone, Eq, Hash, PartialEq, Debug)]
+#[derive(IntoStaticStr, AsRefStr, Clone, Eq, Hash, PartialEq, Debug)]
 pub enum AnimationState {
     Idle,
     WalkLoop,
@@ -205,62 +224,27 @@ fn on_character_ready(
 
     let mut graph = AnimationGraph::new();
     let root = graph.root;
-
     let mut states = HashMap::new();
-    states.insert(
-        AnimationState::Idle,
-        AnimationStateInfo {
-            node: graph.add_clip(gltf.named_animations["Idle_Loop"].clone(), 1.0, root),
-            repeat: RepeatAnimation::Forever,
-            blend: Duration::from_millis(300),
-        },
-    );
-    states.insert(
-        AnimationState::WalkLoop,
-        AnimationStateInfo {
-            node: graph.add_clip(gltf.named_animations["Walk_Loop"].clone(), 1.0, root),
-            repeat: RepeatAnimation::Forever,
-            blend: Duration::from_millis(250),
-        },
-    );
-    states.insert(
-        AnimationState::JogFwdLoop,
-        AnimationStateInfo {
-            node: graph.add_clip(gltf.named_animations["Jog_Fwd_Loop"].clone(), 1.0, root),
-            repeat: RepeatAnimation::Forever,
-            blend: Duration::from_millis(200),
-        },
-    );
-    states.insert(
-        AnimationState::JumpStart,
-        AnimationStateInfo {
-            node: graph.add_clip(gltf.named_animations["Jump_Start"].clone(), 1.0, root),
-            repeat: RepeatAnimation::Never,
-            blend: Duration::from_millis(80),
-        },
-    );
-    states.insert(
-        AnimationState::JumpLoop,
-        AnimationStateInfo {
-            node: graph.add_clip(gltf.named_animations["Jump_Loop"].clone(), 1.0, root),
-            repeat: RepeatAnimation::Forever,
-            blend: Duration::from_millis(150),
-        },
-    );
-    states.insert(
-        AnimationState::JumpLand,
-        AnimationStateInfo {
-            node: graph.add_clip(gltf.named_animations["Jump_Land"].clone(), 1.0, root),
-            repeat: RepeatAnimation::Never,
-            blend: Duration::from_millis(80),
-        },
-    );
+
+    let add = |graph: &mut AnimationGraph, states: &mut HashMap<AnimationState, AnimationStateInfo>, key: AnimationState, clip: Handle<AnimationClip>, repeat: RepeatAnimation, blend: Duration| {
+        let clip_id = clip.id();
+        let node = graph.add_clip(clip, 1.0, root);
+        states.insert(key, AnimationStateInfo { node, clip_id, repeat, blend });
+    };
+
+    add(&mut graph, &mut states, AnimationState::Idle, gltf.named_animations["Idle_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(300));
+    add(&mut graph, &mut states, AnimationState::WalkLoop, gltf.named_animations["Walk_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(250));
+    add(&mut graph, &mut states, AnimationState::JogFwdLoop, gltf.named_animations["Jog_Fwd_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(200));
+    add(&mut graph, &mut states, AnimationState::JumpStart, gltf.named_animations["Jump_Start"].clone(), RepeatAnimation::Never, Duration::from_millis(80));
+    add(&mut graph, &mut states, AnimationState::JumpLoop, gltf.named_animations["Jump_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(50));
+    add(&mut graph, &mut states, AnimationState::JumpLand, gltf.named_animations["Jump_Land"].clone(), RepeatAnimation::Never, Duration::from_millis(80));
 
     let graph_handle = graphs.add(graph);
 
     commands.entity(rig_entity).insert((
         AnimationGraphHandle(graph_handle),
-        AnimationTransitions::new(),
+        PlayingAnimations::new(1),
+        // AnimationTransitions::new(),
     ));
 
     commands.entity(ready.entity).insert((
@@ -275,24 +259,45 @@ fn on_character_ready(
 
 // ---------- Animation reactions ----------
 
+fn play_layer0(
+    entity: Entity,
+    key: AnimationState,
+    links: &Query<&CharacterLink>,
+    playing: &mut Query<&mut PlayingAnimations>,
+    players: &mut Query<&mut AnimationPlayer>,
+    blend_assets: &Assets<AnimationBlendAsset>,
+) {
+    let Ok(link) = links.get(entity) else { return };
+    let Some(info) = link.anims.get(key.clone()) else { return };
+    let Ok(mut playing_animations) = playing.get_mut(link.rig) else { return };
+    let Ok(mut player) = players.get_mut(link.rig) else { return };
+
+    playing_animations.group_mut(AnimationLayer(0)).play(
+        &mut player,
+        PlayingAnimation {
+            nodes: smallvec![info.node],
+            blend: LabeledAnimationBlend {
+                blend: AnimationBlend::Single { clip: info.clip_id },
+                label: Cow::Borrowed(key.into()),
+            },
+        },
+        info.blend,
+        info.repeat,
+        AnimationTransitionMode::ChangeAndRestart,
+        blend_assets,
+    );
+}
+
 fn play_locomotion(
     entity: Entity,
     state: LocomotionState,
     links: &Query<&CharacterLink>,
-    rigs: &mut Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    playing: &mut Query<&mut PlayingAnimations>,
+    players: &mut Query<&mut AnimationPlayer>,
+    blend_assets: &Assets<AnimationBlendAsset>,
 ) {
-    let Ok(link) = links.get(entity) else { return };
-    let key = match state {
-        LocomotionState::Idle => AnimationState::Idle,
-        LocomotionState::Walk => AnimationState::WalkLoop,
-        LocomotionState::Run => AnimationState::JogFwdLoop,
-    };
-    if let Some(info) = link.anims.get(key) {
-        if let Ok((mut player, mut transitions)) = rigs.get_mut(link.rig) {
-            transitions
-                .play(&mut player, info.node, info.blend)
-                .set_repeat(info.repeat);
-        }
+    if let Some(key) = state.animation_key() {
+        play_layer0(entity, key, links, playing, players, blend_assets);
     }
 }
 
@@ -300,40 +305,39 @@ fn play_jump(
     entity: Entity,
     state: AirborneState,
     links: &Query<&CharacterLink>,
-    rigs: &mut Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    playing: &mut Query<&mut PlayingAnimations>,
+    players: &mut Query<&mut AnimationPlayer>,
+    blend_assets: &Assets<AnimationBlendAsset>,
 ) {
-    let Ok(link) = links.get(entity) else { return };
     let key = match state {
         AirborneState::JumpStart => AnimationState::JumpStart,
         AirborneState::JumpLoop => AnimationState::JumpLoop,
         AirborneState::JumpLand => AnimationState::JumpLand,
         AirborneState::Grounded => return, // handled by on_enter_grounded via locomotion
     };
-    if let Some(info) = link.anims.get(key) {
-        if let Ok((mut player, mut transitions)) = rigs.get_mut(link.rig) {
-            transitions
-                .play(&mut player, info.node, info.blend)
-                .set_repeat(info.repeat);
-        }
-    }
+    play_layer0(entity, key, links, playing, players, blend_assets);
 }
 
 fn on_enter_locomotion(
     trigger: On<Enter<LocomotionState>>,
     links: Query<&CharacterLink>,
-    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    mut playing: Query<&mut PlayingAnimations>,
+    mut players: Query<&mut AnimationPlayer>,
+    blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
-    play_locomotion(trigger.entity, trigger.state, &links, &mut rigs);
+    play_locomotion(trigger.entity, trigger.state, &links, &mut playing, &mut players, &blend_assets);
 }
 
 fn on_enter_grounded(
     trigger: On<Enter<airborne_state::Grounded>>,
     locomotion: Query<&LocomotionState>,
     links: Query<&CharacterLink>,
-    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    mut playing: Query<&mut PlayingAnimations>,
+    mut players: Query<&mut AnimationPlayer>,
+    blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
     if let Ok(&state) = locomotion.get(trigger.entity) {
-        play_locomotion(trigger.entity, state, &links, &mut rigs);
+        play_locomotion(trigger.entity, state, &links, &mut playing, &mut players, &blend_assets);
     }
 }
 
@@ -341,9 +345,11 @@ fn on_enter_jump_start(
     trigger: On<Enter<airborne_state::JumpStart>>,
     mut commands: Commands,
     links: Query<&CharacterLink>,
-    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    mut playing: Query<&mut PlayingAnimations>,
+    mut players: Query<&mut AnimationPlayer>,
+    blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
-    play_jump(trigger.entity, AirborneState::JumpStart, &links, &mut rigs);
+    play_jump(trigger.entity, AirborneState::JumpStart, &links, &mut playing, &mut players, &blend_assets);
     commands
         .delayed()
         .secs(JUMP_START_SECS)
@@ -357,10 +363,12 @@ fn on_enter_jump_loop(
     trigger: On<Enter<airborne_state::JumpLoop>>,
     mut commands: Commands,
     links: Query<&CharacterLink>,
-    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    mut playing: Query<&mut PlayingAnimations>,
+    mut players: Query<&mut AnimationPlayer>,
+    blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
     info!("Jump Loop");
-    play_jump(trigger.entity, AirborneState::JumpLoop, &links, &mut rigs);
+    play_jump(trigger.entity, AirborneState::JumpLoop, &links, &mut playing, &mut players, &blend_assets);
     commands
         .delayed()
         .secs(JUMP_LOOP_SECS)
@@ -374,10 +382,12 @@ fn on_enter_jump_land(
     trigger: On<Enter<airborne_state::JumpLand>>,
     mut commands: Commands,
     links: Query<&CharacterLink>,
-    mut rigs: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    mut playing: Query<&mut PlayingAnimations>,
+    mut players: Query<&mut AnimationPlayer>,
+    blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
     info!("Jump Land");
-    play_jump(trigger.entity, AirborneState::JumpLand, &links, &mut rigs);
+    play_jump(trigger.entity, AirborneState::JumpLand, &links, &mut playing, &mut players, &blend_assets);
     commands
         .delayed()
         .secs(JUMP_LAND_SECS)
