@@ -1,7 +1,7 @@
 use std::{borrow::Cow, time::Duration};
 use smallvec::smallvec;
 use bevy::{
-    animation::RepeatAnimation, app::AnimationSystems, gltf::Gltf, platform::collections::HashMap, prelude::*, world_serialization::WorldInstanceReady,
+    animation::{AnimationTargetId, RepeatAnimation}, app::AnimationSystems, asset::AssetPath, gltf::Gltf, platform::collections::HashMap, prelude::*, world_serialization::WorldInstanceReady,
 };
 use bevy_animation_controllers::{
     AnimationBlend, AnimationBlendAsset, AnimationLayer, LabeledAnimationBlend,
@@ -30,26 +30,30 @@ fn main() {
         .init_asset::<AnimationBlendAsset>()
         .add_plugins(FSMPlugin::<LocomotionState>::default())
         .add_plugins(FSMPlugin::<AirborneState>::default())
+        .add_plugins(FSMPlugin::<UpperBodyState>::default())
         .add_systems(Startup, (spawn_character, setup_camera_and_light))
-        .add_systems(Update, drive_locomotion_input)
+        .add_systems(Update, (drive_locomotion_input, drive_upper_body_input, detect_falling, detect_landing))
         .add_systems(
             PostUpdate,
             (playback::advance_transitions, playback::expire_completed_transitions)
                 .before(bevy::animation::animate_targets)
                 .in_set(AnimationSystems),
         )
-        .add_observer(on_enter_locomotion)
         .run();
 }
 
 fn build_app(app: &mut App) {
     fsm_observer!(app, LocomotionState, on_enter_locomotion);
+    fsm_observer!(app, UpperBodyState, on_enter_upper_body);
 
     fsm_observer!(app, AirborneState, on_enter_grounded);
     fsm_observer!(app, AirborneState, on_enter_jump_start);
-    fsm_observer!(app, AirborneState, on_enter_jump_loop);
-    fsm_observer!(app, AirborneState, on_enter_jump_land);
+    fsm_observer!(app, AirborneState, on_enter_falling);
+    fsm_observer!(app, AirborneState, on_enter_landing);
 }
+
+#[derive(Component)]
+struct Grounded;
 
 // ---------- Trait abstractions shared by every FSM layer ----------
 
@@ -109,8 +113,8 @@ impl AnimatedState for LocomotionState {
 enum AirborneState {
     Grounded,
     JumpStart,
-    JumpLoop,
-    JumpLand,
+    Falling,
+    Landing,
 }
 
 impl FSMTransition for AirborneState {
@@ -119,10 +123,42 @@ impl FSMTransition for AirborneState {
         matches!(
             (from, to),
             (Grounded, JumpStart)
-                | (JumpStart, JumpLoop)
-                | (JumpLoop, JumpLand)
-                | (JumpLand, Grounded)
+                | (JumpStart, Falling)
+                | (Falling, Landing)
+                | (Landing, Grounded)
         ) || from == to
+    }
+}
+
+// ---------- Upper body layer ----------
+
+#[derive(Component, EnumEvent, FSMState, Reflect, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[reflect(Component)]
+enum UpperBodyState {
+    Unarmed,
+    PistolIdle,
+}
+
+impl FSMTransition for UpperBodyState {
+    fn can_transition(_from: Self, _to: Self) -> bool {
+        true
+    }
+}
+
+impl AnimatedState for UpperBodyState {
+    fn animation_key(self) -> Option<AnimationState> {
+        match self {
+            UpperBodyState::Unarmed => None,
+            UpperBodyState::PistolIdle => Some(AnimationState::PistolIdleLoop),
+        }
+    }
+
+    fn mask_group(self) -> u32 {
+        UPPER_BODY_MASK_GROUP
+    }
+
+    fn mask(self) -> u64 {
+        UPPER_BODY_MASK
     }
 }
 
@@ -144,16 +180,17 @@ pub enum AnimationState {
     JumpStart,
     JumpLoop,
     JumpLand,
+    PistolIdleLoop,
 }
 
 #[derive(Component, Clone)]
 struct CharacterAnimations {
-    states: HashMap<AnimationState, AnimationStateInfo>,
+    anims: HashMap<AnimationState, AnimationStateInfo>,
 }
 
 impl CharacterAnimations {
     fn get(&self, key: AnimationState) -> Option<&AnimationStateInfo> {
-        self.states.get(&key)
+        self.anims.get(&key)
     }
 }
 
@@ -199,68 +236,82 @@ fn spawn_character(mut commands: Commands, asset_server: Res<AssetServer>) {
         .observe(on_character_ready);
 }
 
+fn is_lower_body_bone(name: &str) -> bool {
+    ["def-hips", "def-thigh", "def-shin", "def-foot", "def-toe"]
+        .iter()
+        .any(|kw| name.to_lowercase().contains(kw))
+}
+
 fn on_character_ready(
     ready: On<WorldInstanceReady>,
     mut commands: Commands,
     children: Query<&Children>,
     q_players: Query<Entity, With<AnimationPlayer>>,
+    bones: Query<(&Name, &AnimationTargetId)>,
     q_pending: Query<&PendingGltf>,
     gltf_assets: Res<Assets<Gltf>>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
 ) {
-    let Ok(PendingGltf(gltf_handle)) = q_pending.get(ready.entity) else {
-        return;
-    };
-    let Some(gltf) = gltf_assets.get(gltf_handle) else {
-        return;
-    };
-    let Some(rig_entity) = children
-        .iter_descendants(ready.entity)
-        .find(|e| q_players.contains(*e))
-    else {
+    let Ok(PendingGltf(gltf_handle)) = q_pending.get(ready.entity) else { return };
+    let Some(gltf) = gltf_assets.get(gltf_handle) else { return };
+    let Some(rig_entity) = children.iter_descendants(ready.entity).find(|e| q_players.contains(*e)) else {
         error!("No AnimationPlayer found on loaded character");
         return;
     };
 
     let mut graph = AnimationGraph::new();
     let root = graph.root;
-    let mut states = HashMap::new();
+    let upper_body_blend = graph.add_blend_with_mask(LOWER_BODY_MASK, 1.0, root);
+    // let add_node = graph.add_additive_blend(1.0, graph.root);
+    // let lower_body_blend = graph.add_blend(1.0, add_node);
+    // let upper_body_blend = graph.add_blend(1.0, add_node);
+    // let full_body = graph.add_blend(1.0, graph.root);
+    let mut anims = HashMap::new();
 
-    let add = |graph: &mut AnimationGraph, states: &mut HashMap<AnimationState, AnimationStateInfo>, key: AnimationState, clip: Handle<AnimationClip>, repeat: RepeatAnimation, blend: Duration| {
+    let mut add_anim = |name, clip: Handle<AnimationClip>, repeat, blend, parent, mask| {
         let clip_id = clip.id();
-        let node = graph.add_clip(clip, 1.0, root);
-        states.insert(key, AnimationStateInfo { node, clip_id, repeat, blend });
+        let node = graph.add_clip_with_mask(clip, mask, 1.0, parent);
+        anims.insert(name, AnimationStateInfo { node, clip_id, repeat, blend });
     };
 
-    add(&mut graph, &mut states, AnimationState::Idle, gltf.named_animations["Idle_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(300));
-    add(&mut graph, &mut states, AnimationState::WalkLoop, gltf.named_animations["Walk_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(250));
-    add(&mut graph, &mut states, AnimationState::JogFwdLoop, gltf.named_animations["Jog_Fwd_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(200));
-    add(&mut graph, &mut states, AnimationState::JumpStart, gltf.named_animations["Jump_Start"].clone(), RepeatAnimation::Never, Duration::from_millis(80));
-    add(&mut graph, &mut states, AnimationState::JumpLoop, gltf.named_animations["Jump_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(50));
-    add(&mut graph, &mut states, AnimationState::JumpLand, gltf.named_animations["Jump_Land"].clone(), RepeatAnimation::Never, Duration::from_millis(80));
+    add_anim(AnimationState::Idle, gltf.named_animations["Idle_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(300), root, UPPER_BODY_MASK);
+    add_anim(AnimationState::WalkLoop, gltf.named_animations["Walk_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(250), root, UPPER_BODY_MASK);
+    add_anim(AnimationState::JogFwdLoop, gltf.named_animations["Jog_Fwd_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(200), root, UPPER_BODY_MASK);
+    add_anim(AnimationState::JumpStart, gltf.named_animations["Jump_Start"].clone(), RepeatAnimation::Never, Duration::from_millis(80), root, UPPER_BODY_MASK);
+    add_anim(AnimationState::JumpLoop, gltf.named_animations["Jump_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(50), root, UPPER_BODY_MASK);
+    add_anim(AnimationState::JumpLand, gltf.named_animations["Jump_Land"].clone(), RepeatAnimation::Never, Duration::from_millis(80), root, UPPER_BODY_MASK);
+
+    // Upper-body layer: masked to exclude the lower body group.
+    add_anim(AnimationState::PistolIdleLoop, gltf.named_animations["Pistol_Idle_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(250), upper_body_blend, 0);
+
+    for (name, target_id) in children.iter_descendants(rig_entity).filter_map(|e| bones.get(e).ok()) {
+        let group = if is_lower_body_bone(name.as_str()) { LOWER_BODY_MASK_GROUP } else { UPPER_BODY_MASK_GROUP };
+        graph.add_target_to_mask_group(*target_id, group);
+    }
 
     let graph_handle = graphs.add(graph);
 
     commands.entity(rig_entity).insert((
         AnimationGraphHandle(graph_handle),
-        PlayingAnimations::new(1),
-        // AnimationTransitions::new(),
+        PlayingAnimations::new(2),
     ));
 
     commands.entity(ready.entity).insert((
         LocomotionState::Idle,
         AirborneState::Grounded,
+        UpperBodyState::PistolIdle,
         CharacterLink {
             rig: rig_entity,
-            anims: CharacterAnimations { states },
+            anims: CharacterAnimations { anims },
         },
     ));
 }
 
 // ---------- Animation reactions ----------
 
-fn play_layer0(
+fn play_animation(
     entity: Entity,
+    layer: AnimationLayer,
     key: AnimationState,
     links: &Query<&CharacterLink>,
     playing: &mut Query<&mut PlayingAnimations>,
@@ -272,7 +323,7 @@ fn play_layer0(
     let Ok(mut playing_animations) = playing.get_mut(link.rig) else { return };
     let Ok(mut player) = players.get_mut(link.rig) else { return };
 
-    playing_animations.group_mut(AnimationLayer(0)).play(
+    playing_animations.group_mut(layer).play(
         &mut player,
         PlayingAnimation {
             nodes: smallvec![info.node],
@@ -288,19 +339,6 @@ fn play_layer0(
     );
 }
 
-fn play_locomotion(
-    entity: Entity,
-    state: LocomotionState,
-    links: &Query<&CharacterLink>,
-    playing: &mut Query<&mut PlayingAnimations>,
-    players: &mut Query<&mut AnimationPlayer>,
-    blend_assets: &Assets<AnimationBlendAsset>,
-) {
-    if let Some(key) = state.animation_key() {
-        play_layer0(entity, key, links, playing, players, blend_assets);
-    }
-}
-
 fn play_jump(
     entity: Entity,
     state: AirborneState,
@@ -311,11 +349,11 @@ fn play_jump(
 ) {
     let key = match state {
         AirborneState::JumpStart => AnimationState::JumpStart,
-        AirborneState::JumpLoop => AnimationState::JumpLoop,
-        AirborneState::JumpLand => AnimationState::JumpLand,
+        AirborneState::Falling => AnimationState::JumpLoop,
+        AirborneState::Landing => AnimationState::JumpLand,
         AirborneState::Grounded => return, // handled by on_enter_grounded via locomotion
     };
-    play_layer0(entity, key, links, playing, players, blend_assets);
+    play_animation(entity, AnimationLayer(0), key, links, playing, players, blend_assets);
 }
 
 fn on_enter_locomotion(
@@ -325,7 +363,21 @@ fn on_enter_locomotion(
     mut players: Query<&mut AnimationPlayer>,
     blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
-    play_locomotion(trigger.entity, trigger.state, &links, &mut playing, &mut players, &blend_assets);
+    if let Some(key) = trigger.state.animation_key() {
+        play_animation(trigger.entity, AnimationLayer(0), key, &links, &mut playing, &mut players, &blend_assets);
+    }
+}
+
+fn on_enter_upper_body(
+    trigger: On<Enter<UpperBodyState>>,
+    links: Query<&CharacterLink>,
+    mut playing: Query<&mut PlayingAnimations>,
+    mut players: Query<&mut AnimationPlayer>,
+    blend_assets: Res<Assets<AnimationBlendAsset>>,
+) {
+    if let Some(key) = trigger.state.animation_key() {
+        play_animation(trigger.entity, AnimationLayer(1), key, &links, &mut playing, &mut players, &blend_assets);
+    }
 }
 
 fn on_enter_grounded(
@@ -337,7 +389,9 @@ fn on_enter_grounded(
     blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
     if let Ok(&state) = locomotion.get(trigger.entity) {
-        play_locomotion(trigger.entity, state, &links, &mut playing, &mut players, &blend_assets);
+        if let Some(key) = state.animation_key() {
+            play_animation(trigger.entity, AnimationLayer(0), key, &links, &mut playing, &mut players, &blend_assets);
+        }
     }
 }
 
@@ -355,12 +409,12 @@ fn on_enter_jump_start(
         .secs(JUMP_START_SECS)
         .trigger(StateChangeRequest {
             entity: trigger.entity,
-            next: AirborneState::JumpLoop,
+            next: AirborneState::Falling,
         });
 }
 
-fn on_enter_jump_loop(
-    trigger: On<Enter<airborne_state::JumpLoop>>,
+fn on_enter_falling(
+    trigger: On<Enter<airborne_state::Falling>>,
     mut commands: Commands,
     links: Query<&CharacterLink>,
     mut playing: Query<&mut PlayingAnimations>,
@@ -368,18 +422,18 @@ fn on_enter_jump_loop(
     blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
     info!("Jump Loop");
-    play_jump(trigger.entity, AirborneState::JumpLoop, &links, &mut playing, &mut players, &blend_assets);
+    play_jump(trigger.entity, AirborneState::Falling, &links, &mut playing, &mut players, &blend_assets);
     commands
         .delayed()
         .secs(JUMP_LOOP_SECS)
         .trigger(StateChangeRequest {
             entity: trigger.entity,
-            next: AirborneState::JumpLand,
+            next: AirborneState::Landing,
         });
 }
 
-fn on_enter_jump_land(
-    trigger: On<Enter<airborne_state::JumpLand>>,
+fn on_enter_landing(
+    trigger: On<Enter<airborne_state::Landing>>,
     mut commands: Commands,
     links: Query<&CharacterLink>,
     mut playing: Query<&mut PlayingAnimations>,
@@ -387,7 +441,7 @@ fn on_enter_jump_land(
     blend_assets: Res<Assets<AnimationBlendAsset>>,
 ) {
     info!("Jump Land");
-    play_jump(trigger.entity, AirborneState::JumpLand, &links, &mut playing, &mut players, &blend_assets);
+    play_jump(trigger.entity, AirborneState::Landing, &links, &mut playing, &mut players, &blend_assets);
     commands
         .delayed()
         .secs(JUMP_LAND_SECS)
@@ -426,6 +480,51 @@ fn drive_locomotion_input(
                     next: AirborneState::JumpStart,
                 });
             }
+        }
+    }
+}
+
+fn drive_upper_body_input(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    characters: Query<(Entity, &UpperBodyState)>,
+) {
+    let desired = if mouse.pressed(MouseButton::Right) {
+        UpperBodyState::PistolIdle
+    } else {
+        UpperBodyState::Unarmed
+    };
+
+    for (entity, &current) in &characters {
+        if current != desired {
+            commands.trigger(StateChangeRequest { entity, next: desired });
+        }
+    }
+}
+
+
+
+fn detect_falling(
+    mut removed: RemovedComponents<Grounded>,
+    mut commands: Commands,
+    airborne: Query<&AirborneState>,
+) {
+    for entity in removed.read() {
+        if airborne.get(entity) == Ok(&AirborneState::Grounded) {
+            commands.trigger(StateChangeRequest { entity, next: AirborneState::Falling });
+        }
+    }
+}
+
+fn detect_landing(
+    grounded_added: Query<Entity, Added<Grounded>>,
+    mut commands: Commands,
+    airborne: Query<&AirborneState>,
+) {
+    for entity in &grounded_added {
+        match airborne.get(entity) {
+            Ok(&AirborneState::Falling) => commands.trigger(StateChangeRequest { entity, next: AirborneState::Landing }),
+            _ => {}
         }
     }
 }
