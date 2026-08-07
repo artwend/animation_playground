@@ -1,7 +1,5 @@
 use bevy::prelude::*;
-use bevy_animation_controllers::{
-    AnimationBlendAsset,
-};
+use bevy_animation_controllers::AnimationBlendAsset;
 
 use bevy_animation_controllers::{
     AnimationBlend, AnimationBlendTime, AnimationLayer, LabeledAnimationBlend,
@@ -48,7 +46,10 @@ pub(crate) struct JumpAnimationClips {
 
 #[derive(Clone, Resource, Default)]
 pub(crate) struct UpperBodyAnimationClips {
-    pub pistol_aim: Handle<AnimationClip>,
+    pub pistol_aim_up: Handle<AnimationClip>,
+    pub pistol_aim_neutral: Handle<AnimationClip>,
+    pub pistol_aim_down: Handle<AnimationClip>,
+    pub pistol_aim_blend: Handle<AnimationBlendAsset>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -204,12 +205,13 @@ impl AnimationControl for LocomotionController {
                 let upper_body_clips = &param.2;
                 match state.upper_body {
                     UpperBodyState::PistolAim => (
-                        Some(LabeledAnimationBlend::from(AnimationBlend::Single {
-                            clip: upper_body_clips.pistol_aim.id(),
+                        Some(LabeledAnimationBlend::from(AnimationBlend::Blend {
+                            blend: upper_body_clips.pistol_aim_blend.id(),
+                            time: AnimationBlendTime::Blend1d(0.0),
                         })),
                         Duration::from_millis(150),
                     ),
-                    UpperBodyState::Unarmed => (None, Duration::from_millis(150)),
+                    UpperBodyState::Unarmed => (None, Duration::from_millis(50)),
                 }
             }
             _ => (None, Duration::ZERO),

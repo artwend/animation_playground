@@ -1,4 +1,5 @@
 mod animation;
+mod ik;
 
 use animation::{AnimationBlendAssetHandle, LocomotionController};
 use bevy::{
@@ -29,6 +30,7 @@ use bevy_animation_controllers::{
 use bevy_fsm::{
     Enter, EnumEvent, FSMPlugin, FSMState, FSMTransition, StateChangeRequest, fsm_observer,
 };
+use ik::SpineIkChain;
 use smallvec::smallvec;
 use std::{borrow::Cow, time::Duration};
 use strum::{AsRefStr, IntoStaticStr};
@@ -335,6 +337,7 @@ fn on_character_spawned(
 
     // Load 8 directional animation clips, jump clips & pistol aim clip
     let idle = gltf.named_animations["Idle_Loop"].clone();
+
     let walk_n = gltf2.named_animations["Walk_Fwd_Loop"].clone();
     let walk_ne = gltf2.named_animations["Walk_Fwd_R_Loop"].clone();
     let walk_e = gltf2.named_animations["Walk_R_Loop"].clone();
@@ -344,11 +347,33 @@ fn on_character_spawned(
     let walk_w = gltf2.named_animations["Walk_L_Loop"].clone();
     let walk_nw = gltf2.named_animations["Walk_Fwd_L"].clone();
 
+    let jog_n = gltf.named_animations["Jog_Fwd_Loop"].clone();
+    let jog_ne = gltf.named_animations["Jog_Fwd_R_Loop"].clone();
+    let jog_e = gltf.named_animations["Jog_Right_Loop"].clone();
+    let jog_se = gltf.named_animations["Jog_Bwd_R_Loop"].clone();
+    let jog_s = gltf.named_animations["Jog_Bwd_Loop"].clone();
+    let jog_sw = gltf.named_animations["Jog_Bwd_L_Loop"].clone();
+    let jog_w = gltf.named_animations["Jog_Left_Loop"].clone();
+    let jog_nw = gltf.named_animations["Jog_Fwd_L_Loop"].clone();
+
     let jump_start = gltf.named_animations["Jump_Start"].clone();
     let jump_loop = gltf.named_animations["Jump_Loop"].clone();
     let jump_land = gltf.named_animations["Jump_Land"].clone();
 
-    let pistol_aim = gltf.named_animations["Pistol_Aim_Neutral"].clone();
+    let pistol_aim_up = gltf.named_animations["Pistol_Aim_Up"].clone();
+    let pistol_aim_neutral = gltf.named_animations["Pistol_Aim_Neutral"].clone();
+    let pistol_aim_down = gltf.named_animations["Pistol_Aim_Down"].clone();
+
+    let aim_blend = AnimationBlendAsset {
+        blend_type: AnimationBlendAssetType::Blend1d {
+            stops: vec![
+                AnimationBlendAssetStop1d::new(pistol_aim_down.clone(), -1.0),
+                AnimationBlendAssetStop1d::new(pistol_aim_neutral.clone(), 0.0),
+                AnimationBlendAssetStop1d::new(pistol_aim_up.clone(), 1.0),
+            ],
+        },
+    };
+    let aim_blend_handle = blend_assets.add(aim_blend);
 
     commands.insert_resource(animation::JumpAnimationClips {
         jump_start: jump_start.clone(),
@@ -357,25 +382,43 @@ fn on_character_spawned(
     });
 
     commands.insert_resource(animation::UpperBodyAnimationClips {
-        pistol_aim: pistol_aim.clone(),
+        pistol_aim_up: pistol_aim_up.clone(),
+        pistol_aim_neutral: pistol_aim_neutral.clone(),
+        pistol_aim_down: pistol_aim_down.clone(),
+        pistol_aim_blend: aim_blend_handle.clone(),
     });
 
     let blend = AnimationBlendAsset {
         blend_type: AnimationBlendAssetType::Blend2d {
             center: AnimationBlendAssetClipHandle(idle),
-            rings: vec![AnimationBlendAssetRing2d {
-                time: 1.0, // radius: full walk speed
-                stops: vec![
-                    AnimationBlendAssetStop1d::new(walk_n, 0.0), // North
-                    AnimationBlendAssetStop1d::new(walk_ne, std::f32::consts::FRAC_PI_4), // NE
-                    AnimationBlendAssetStop1d::new(walk_e, std::f32::consts::FRAC_PI_2), // East
-                    AnimationBlendAssetStop1d::new(walk_se, 3.0 * std::f32::consts::FRAC_PI_4), // SE
-                    AnimationBlendAssetStop1d::new(walk_s, std::f32::consts::PI), // South
-                    AnimationBlendAssetStop1d::new(walk_sw, 5.0 * std::f32::consts::FRAC_PI_4), // SW
-                    AnimationBlendAssetStop1d::new(walk_w, 3.0 * std::f32::consts::FRAC_PI_2), // West
-                    AnimationBlendAssetStop1d::new(walk_nw, 7.0 * std::f32::consts::FRAC_PI_4), // NW
-                ],
-            }],
+            rings: vec![
+                AnimationBlendAssetRing2d {
+                    time: 1.0, // radius: full walk speed
+                    stops: vec![
+                        AnimationBlendAssetStop1d::new(walk_n, 0.0), // North
+                        AnimationBlendAssetStop1d::new(walk_ne, std::f32::consts::FRAC_PI_4), // NE
+                        AnimationBlendAssetStop1d::new(walk_e, std::f32::consts::FRAC_PI_2), // East
+                        AnimationBlendAssetStop1d::new(walk_se, 3.0 * std::f32::consts::FRAC_PI_4), // SE
+                        AnimationBlendAssetStop1d::new(walk_s, std::f32::consts::PI), // South
+                        AnimationBlendAssetStop1d::new(walk_sw, 5.0 * std::f32::consts::FRAC_PI_4), // SW
+                        AnimationBlendAssetStop1d::new(walk_w, 3.0 * std::f32::consts::FRAC_PI_2), // West
+                        AnimationBlendAssetStop1d::new(walk_nw, 7.0 * std::f32::consts::FRAC_PI_4), // NW
+                    ],
+                },
+                AnimationBlendAssetRing2d {
+                    time: 2.0, // Jog speed radius
+                    stops: vec![
+                        AnimationBlendAssetStop1d::new(jog_n, 0.0),
+                        AnimationBlendAssetStop1d::new(jog_ne, std::f32::consts::FRAC_PI_4),
+                        AnimationBlendAssetStop1d::new(jog_e, std::f32::consts::FRAC_PI_2),
+                        AnimationBlendAssetStop1d::new(jog_se, 3.0 * std::f32::consts::FRAC_PI_4),
+                        AnimationBlendAssetStop1d::new(jog_s, std::f32::consts::PI),
+                        AnimationBlendAssetStop1d::new(jog_sw, 5.0 * std::f32::consts::FRAC_PI_4),
+                        AnimationBlendAssetStop1d::new(jog_w, 3.0 * std::f32::consts::FRAC_PI_2),
+                        AnimationBlendAssetStop1d::new(jog_nw, 7.0 * std::f32::consts::FRAC_PI_4),
+                    ],
+                },
+            ],
         },
     };
 
@@ -397,7 +440,7 @@ fn on_character_spawned(
 
     // Group 1 = Layer 1 (Upper Body / Pistol Aim)
     let group_upper_body = AnimationRetargetGroup {
-        animations: vec![(pistol_aim.id().into(), RepeatAnimation::Forever)],
+        animations: vec![(aim_blend_handle.id().into(), RepeatAnimation::Forever)],
         graph_node: upper_body_node,
     };
 
@@ -457,8 +500,11 @@ fn keyboard_input(
         input.x += 1.0;
     }
 
+    let is_jogging = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let speed = if is_jogging { 2.0 } else { 1.0 };
+
     let velocity = if input != Vec2::ZERO {
-        input.normalize()
+        input.normalize() * speed
     } else {
         Vec2::ZERO
     };
@@ -629,9 +675,6 @@ fn on_character_ready(
         upper_body_blend,
         0,
     );
-    // add_anim(AnimationState::PistolIdleLoop, gltf.named_animations["Pistol_Idle_Loop"].clone(), RepeatAnimation::Forever, Duration::from_millis(250), add_node, UPPER_BODY_MASK);
-    // add_anim(AnimationState::PistolIdleLoop, gltf.named_animations["Pistol_Aim_Up"].clone(), RepeatAnimation::Forever, Duration::from_millis(250), aim_add, 0);
-    // add_anim(AnimationState::PistolIdleLoop, gltf.named_animations["Pistol_Aim_Down"].clone(), RepeatAnimation::Forever, Duration::from_millis(250), aim_add, 0);
 
     dbg!(&graph);
 
@@ -728,33 +771,6 @@ fn play_jump(
     );
 }
 
-fn stop_layer(
-    layer: &mut playback::LayerAnimations,
-    player: &mut AnimationPlayer,
-    transition_duration: Duration,
-) {
-    let Some(old) = layer.main_animation.take() else {
-        return;
-    };
-    for node in old.nodes.iter() {
-        if transition_duration.is_zero() {
-            player.stop(*node);
-            continue;
-        }
-        let Some(old_animation) = player.animation_mut(*node) else {
-            continue;
-        };
-        if old_animation.is_paused() {
-            continue;
-        }
-        layer.transitions.push(playback::TransitioningAnimation {
-            current_weight: old_animation.weight(),
-            weight_decline_per_sec: 1.0 / transition_duration.as_secs_f32(),
-            animation: *node,
-        });
-    }
-}
-
 fn on_enter_locomotion(
     trigger: On<Enter<LocomotionState>>,
     links: Query<&CharacterLink>,
@@ -804,11 +820,10 @@ fn on_enter_upper_body(
             let Ok(mut player) = players.get_mut(link.rig) else {
                 return;
             };
-            stop_layer(
-                playing_animations.group_mut(AnimationLayer(1)),
-                &mut player,
-                Duration::from_millis(200),
-            );
+
+            playing_animations
+                .group_mut(AnimationLayer(1))
+                .stop(&mut player, Duration::from_millis(200));
         }
     }
 }
