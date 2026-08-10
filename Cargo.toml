@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["3d"] }
+bevy = { version = "0.19", default-features = false, features = ["3d", "debug", "bevy_remote"] }
 bevy_fsm = "0.4"
-bevy-animation-controllers = { git = "https://github.com/pcwalton/bevy-animation-controllers"}
-smallvec = "1.15"
-strum = { version = "0.28", features = ["derive"] }
+bevy_asset_loader = "0.27"
+# bevy-animation-controllers = { git = "https://github.com/artwend/bevy-animation-controllers", branch = "playback-fixes" }
+bevy-animation-controllers = { path = "../bevy-animation-controllers" }

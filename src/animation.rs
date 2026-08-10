@@ -1,8 +1,7 @@
 use bevy::prelude::*;
-use bevy_animation_controllers::AnimationBlendAsset;
-
 use bevy_animation_controllers::{
-    AnimationBlend, AnimationBlendTime, AnimationLayer, LabeledAnimationBlend,
+    AnimationBlend, AnimationBlendAsset, AnimationBlendTime, AnimationLayer,
+    LabeledAnimationBlend,
     control::{AnimationControl, AnimationTransitionMode},
 };
 use std::time::Duration;
@@ -16,6 +15,11 @@ pub(crate) enum JumpPhase {
     JumpLand,
 }
 
+/// Whether the upper-body layer should be blended in.
+///
+/// This is only a *desired* state. The actual blend amount is ramped toward
+/// this state by `update_upper_body_blend` in `main.rs`, which adjusts the
+/// weight of the upper-body blend node in the animation graph.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum UpperBodyState {
     #[default]
@@ -30,7 +34,6 @@ pub(crate) struct LocomotionController {
     pub jump_timer: Timer,
     pub upper_body: UpperBodyState,
     pub current_locomotion_state: LocomotionState,
-    pub current_upper_body_state: UpperBodyState,
     pub initialized: bool,
 }
 
@@ -46,9 +49,6 @@ pub(crate) struct JumpAnimationClips {
 
 #[derive(Clone, Resource, Default)]
 pub(crate) struct UpperBodyAnimationClips {
-    pub pistol_aim_up: Handle<AnimationClip>,
-    pub pistol_aim_neutral: Handle<AnimationClip>,
-    pub pistol_aim_down: Handle<AnimationClip>,
     pub pistol_aim_blend: Handle<AnimationBlendAsset>,
 }
 
@@ -70,7 +70,6 @@ pub(crate) struct LocomotionState {
 #[derive(Clone)]
 pub(crate) struct CharacterAnimState {
     pub locomotion: LocomotionState,
-    pub upper_body: UpperBodyState,
 }
 
 impl AnimationControl for LocomotionController {
@@ -81,7 +80,8 @@ impl AnimationControl for LocomotionController {
         Res<'static, UpperBodyAnimationClips>,
     );
 
-    const LAYER_COUNT: u32 = 2; // Layer 0 = Locomotion/Jump, Layer 1 = Upper Body
+    // Layer 0 = locomotion/jump (whole body), Layer 1 = upper body (aim).
+    const LAYER_COUNT: u32 = 2;
 
     fn compute_new_animation_state(
         &self,
@@ -131,15 +131,12 @@ impl AnimationControl for LocomotionController {
                 LocomotionState {
                     active: ActiveAnimation::LocomotionBlend { speed, angle },
                     blend: LabeledAnimationBlend::from(blend),
-                    transition: Duration::from_millis(150),
+                    transition: Duration::from_millis(250),
                 }
             }
         };
 
-        CharacterAnimState {
-            locomotion,
-            upper_body: self.upper_body,
-        }
+        CharacterAnimState { locomotion }
     }
 
     fn compute_animation_action(
@@ -156,7 +153,8 @@ impl AnimationControl for LocomotionController {
                 let old = &self.current_locomotion_state;
                 if new_state.locomotion.active != old.active {
                     AnimationTransitionMode::ChangeAndRestart
-                } else if let (
+                } else
+                if let (
                     ActiveAnimation::LocomotionBlend {
                         speed: new_speed,
                         angle: new_angle,
@@ -169,9 +167,8 @@ impl AnimationControl for LocomotionController {
                 {
                     if (new_speed < 0.01) != (old_speed < 0.01) {
                         AnimationTransitionMode::ChangeAndRestart
-                    } else if (new_speed - old_speed).abs() > 0.05
-                        || (new_angle - old_angle).abs() > 0.1
-                    {
+                    } else
+                    if (new_speed - old_speed).abs() > 0.05 || (new_angle - old_angle).abs() > 0.1 {
                         AnimationTransitionMode::ChangeTime
                     } else {
                         AnimationTransitionMode::NoChange
@@ -180,13 +177,9 @@ impl AnimationControl for LocomotionController {
                     AnimationTransitionMode::NoChange
                 }
             }
-            1 => {
-                if new_state.upper_body != self.current_upper_body_state {
-                    AnimationTransitionMode::ChangeAndRestart
-                } else {
-                    AnimationTransitionMode::NoChange
-                }
-            }
+            // The upper-body layer always keeps the aim blend playing; its
+            // visibility is controlled by the blend node weight instead.
+            1 => AnimationTransitionMode::NoChange,
             _ => AnimationTransitionMode::NoChange,
         }
     }
@@ -203,16 +196,13 @@ impl AnimationControl for LocomotionController {
             ),
             1 => {
                 let upper_body_clips = &param.2;
-                match state.upper_body {
-                    UpperBodyState::PistolAim => (
-                        Some(LabeledAnimationBlend::from(AnimationBlend::Blend {
-                            blend: upper_body_clips.pistol_aim_blend.id(),
-                            time: AnimationBlendTime::Blend1d(0.0),
-                        })),
-                        Duration::from_millis(150),
-                    ),
-                    UpperBodyState::Unarmed => (None, Duration::from_millis(50)),
-                }
+                (
+                    Some(LabeledAnimationBlend::from(AnimationBlend::Blend {
+                        blend: upper_body_clips.pistol_aim_blend.id(),
+                        time: AnimationBlendTime::Blend1d(0.0),
+                    })),
+                    Duration::from_millis(150),
+                )
             }
             _ => (None, Duration::ZERO),
         }
@@ -220,7 +210,6 @@ impl AnimationControl for LocomotionController {
 
     fn set_current_animation_state(&mut self, new_state: &Self::AnimationState) {
         self.current_locomotion_state = new_state.locomotion.clone();
-        self.current_upper_body_state = new_state.upper_body;
         self.initialized = true;
     }
 }
