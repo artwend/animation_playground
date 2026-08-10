@@ -60,7 +60,10 @@ pub(crate) fn build_animation_assets(
 
     // -- Collect clips --
     let clip = |gltf: &Gltf, name: &str| -> Handle<AnimationClip> {
-        gltf.named_animations[name].clone()
+        gltf.named_animations.get(name).cloned().unwrap_or_else(|| {
+            error!("Animation clip not found: {}", name);
+            Handle::default()
+        })
     };
 
     let directional_clips = |gltf: &Gltf, names: &[&str; 8]| -> Vec<Handle<AnimationClip>> {
